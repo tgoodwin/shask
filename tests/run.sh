@@ -11,6 +11,24 @@ cat <<'STUB' > "$TMP_DIR/llm"
 if [[ -n "${LLM_CAPTURE_ARGS:-}" ]]; then
   printf '%s\n' "$@" > "$LLM_CAPTURE_ARGS"
 fi
+if [[ -n "${LLM_MOCK_RESPONSES_FILE:-}" ]]; then
+  sep="<<<LLM>>>"
+  tmp_file="$(mktemp)"
+  found_sep=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ $found_sep -eq 0 && "$line" == "$sep" ]]; then
+      found_sep=1
+      continue
+    fi
+    if [[ $found_sep -eq 0 ]]; then
+      printf '%s\n' "$line"
+    else
+      printf '%s\n' "$line" >> "$tmp_file"
+    fi
+  done < "$LLM_MOCK_RESPONSES_FILE"
+  mv "$tmp_file" "$LLM_MOCK_RESPONSES_FILE"
+  exit 0
+fi
 if [[ -n "${LLM_MOCK_RESPONSE:-}" ]]; then
   printf '%s' "$LLM_MOCK_RESPONSE"
 fi
@@ -27,9 +45,68 @@ run_asksh() {
   local stderr_file
   stderr_file="$(mktemp)"
   set +e
-  LAST_OUT=$(PATH="$TMP_DIR:$PATH" LLM_MOCK_RESPONSE="$resp" "$ROOT_DIR/bin/asksh" "$@" 2>"$stderr_file")
+  LAST_OUT=$(PATH="$TMP_DIR:$PATH" LLM_MOCK_RESPONSE="$resp" "$ROOT_DIR/bin/shask" "$@" 2>"$stderr_file")
   LAST_STATUS=$?
   set -e
+  LAST_ERR=$(cat "$stderr_file")
+  rm -f "$stderr_file"
+}
+
+run_asksh_tty() {
+  local resp_file="$1"
+  local user_input="$2"
+  shift 2
+  local stderr_file
+  stderr_file="$(mktemp)"
+  set +e
+  LAST_OUT=$(ASKSH_TTY_INPUT="$user_input" PATH="$TMP_DIR:$PATH" LLM_MOCK_RESPONSES_FILE="$resp_file" python3 - "$ROOT_DIR/bin/shask" "$@" 2>"$stderr_file" <<'PY'
+import os
+import pty
+import select
+import subprocess
+import sys
+import time
+
+cmd = [sys.argv[1]] + sys.argv[2:]
+env = os.environ.copy()
+master, slave = pty.openpty()
+proc = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave, env=env)
+os.close(slave)
+
+data = env.get("ASKSH_TTY_INPUT", "").encode()
+if data:
+    time.sleep(0.05)
+    os.write(master, data)
+
+out = bytearray()
+while True:
+    if proc.poll() is not None:
+        try:
+            while True:
+                chunk = os.read(master, 1024)
+                if not chunk:
+                    break
+                out.extend(chunk)
+        except OSError:
+            pass
+        break
+    r, _, _ = select.select([master], [], [], 0.1)
+    if master in r:
+        try:
+            chunk = os.read(master, 1024)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out.extend(chunk)
+
+sys.stdout.buffer.write(out)
+sys.exit(proc.returncode or 0)
+PY
+)
+  LAST_STATUS=$?
+  set -e
+  LAST_OUT=$(printf '%s\n' "$LAST_OUT" | tr -d '\r' | awk 'NF{last=$0} END{print last}')
   LAST_ERR=$(cat "$stderr_file")
   rm -f "$stderr_file"
 }
@@ -60,6 +137,18 @@ assert_eq $'ls -la\nlist files' "$LAST_OUT" "--explain outputs command and expla
 run_asksh $'NEED_MORE_INFO: which directory?' \"list files\"
 assert_eq 2 "$LAST_STATUS" "needs more info exits 2"
 assert_eq "NEED_MORE_INFO: which directory?" "$LAST_OUT" "needs more info output"
+
+# Test: NEED_MORE_INFO in TTY prompts and retries
+resp_file="$(mktemp)"
+cat <<'RESP' > "$resp_file"
+NEED_MORE_INFO: which directory?
+<<<LLM>>>
+CMD: ls -la /tmp
+WHY: list tmp
+RESP
+run_asksh_tty "$resp_file" $'/tmp\n' \"list files\"
+assert_eq "ls -la /tmp" "$LAST_OUT" "tty returns command after clarification"
+rm -f "$resp_file"
 
 # Test: --raw prints output verbatim
 run_asksh $'hello\nworld' --raw \"list files\"
