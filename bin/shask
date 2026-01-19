@@ -5,6 +5,37 @@ usage() {
   echo "Usage: shask [--explain|--no-explain] [--raw] [--model MODEL] <question...>" >&2
 }
 
+spinner_pid=""
+
+start_spinner() {
+  if [[ ! -t 2 ]]; then
+    return 0
+  fi
+
+  local frames='|/-\'
+  local i=0
+  (
+    while :; do
+      printf '\r%s' "${frames:i++%4:1}" >&2
+      sleep 0.1
+    done
+  ) &
+  spinner_pid=$!
+}
+
+stop_spinner() {
+  if [[ -z "${spinner_pid}" ]]; then
+    return 0
+  fi
+
+  kill "${spinner_pid}" 2>/dev/null || true
+  wait "${spinner_pid}" 2>/dev/null || true
+  spinner_pid=""
+  printf '\r \r' >&2
+}
+
+trap stop_spinner EXIT
+
 explain=0
 raw=0
 model=""
@@ -82,6 +113,7 @@ PROMPT
 
   llm_stderr="$(mktemp)"
   set +e
+  start_spinner
   if [[ -n "$model" ]]; then
     llm_output=$(llm -m "$model" "$prompt" 2>"$llm_stderr")
   else
@@ -89,6 +121,7 @@ PROMPT
   fi
   status=$?
   set -e
+  stop_spinner
 
   if [[ $status -ne 0 ]]; then
     echo "asksh: llm failed ($status)" >&2
