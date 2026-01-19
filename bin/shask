@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "Usage: shask [--explain|--no-explain] [--raw] [--model MODEL] <question...>" >&2
+}
+
+explain=0
+raw=0
+model=""
+args=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --explain)
+      explain=1
+      shift
+      ;;
+    --no-explain)
+      explain=0
+      shift
+      ;;
+    --raw)
+      raw=1
+      shift
+      ;;
+    --model)
+      if [[ $# -lt 2 ]]; then
+        usage
+        exit 1
+      fi
+      model="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      args+=("$@")
+      break
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#args[@]} -eq 0 ]]; then
+  usage
+  exit 1
+fi
+
+if ! command -v llm >/dev/null 2>&1; then
+  echo "asksh: llm not found in PATH" >&2
+  exit 127
+fi
+
+user_request="${args[*]}"
+
+prompt=$(cat <<PROMPT
+You are a shell-command generator. Follow the rules strictly.
+Rules:
+- Output exactly one of the formats below and nothing else.
+- No markdown, no code fences, no backticks, no extra commentary.
+Format A:
+CMD: <single-line shell command>
+WHY: <optional short explanation, max 100 chars>
+Format B:
+NEED_MORE_INFO: <single short clarification question>
+Only output one CMD line. Prefer bash-compatible, safe, concise commands.
+User request: ${user_request}
+PROMPT
+)
+
+llm_stderr="$(mktemp)"
+set +e
+if [[ -n "$model" ]]; then
+  llm_output=$(llm -m "$model" "$prompt" 2>"$llm_stderr")
+else
+  llm_output=$(llm "$prompt" 2>"$llm_stderr")
+fi
+status=$?
+set -e
+
+if [[ $status -ne 0 ]]; then
+  echo "asksh: llm failed ($status)" >&2
+  if [[ -s "$llm_stderr" ]]; then
+    cat "$llm_stderr" >&2
+  fi
+  rm -f "$llm_stderr"
+  exit "$status"
+fi
+rm -f "$llm_stderr"
+
+if [[ $raw -eq 1 ]]; then
+  printf '%s\n' "$llm_output"
+  exit 0
+fi
+
+cmd=""
+why=""
+need=""
+
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  if [[ -z "$cmd" && "$line" == CMD:* ]]; then
+    cmd="${line#CMD:}"
+    cmd="${cmd# }"
+    continue
+  fi
+  if [[ -z "$why" && "$line" == WHY:* ]]; then
+    why="${line#WHY:}"
+    why="${why# }"
+    continue
+  fi
+  if [[ -z "$need" && "$line" == NEED_MORE_INFO:* ]]; then
+    need="${line#NEED_MORE_INFO:}"
+    need="${need# }"
+  fi
+done <<<"$llm_output"
+
+if [[ -n "$cmd" ]]; then
+  printf '%s\n' "$cmd"
+  if [[ $explain -eq 1 && -n "$why" ]]; then
+    printf '%s\n' "$why"
+  fi
+  exit 0
+fi
+
+if [[ -n "$need" ]]; then
+  printf 'NEED_MORE_INFO: %s\n' "$need"
+  exit 2
+fi
+
+printf 'NEED_MORE_INFO: Please rephrase your request\n'
+exit 2
