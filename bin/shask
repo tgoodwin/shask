@@ -6,6 +6,12 @@ usage() {
 }
 
 spinner_pid=""
+clipboard_cmd=()
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/shask"
+state_file="${state_dir}/last.json"
+last_question=""
+last_cmd=""
+last_why=""
 
 start_spinner() {
   if [[ ! -t 2 ]]; then
@@ -35,6 +41,163 @@ stop_spinner() {
 }
 
 trap stop_spinner EXIT
+
+is_tty_output() {
+  [[ -t 1 ]]
+}
+
+is_tty_input() {
+  [[ -t 0 ]]
+}
+
+color_enabled() {
+  [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-}" != "dumb" ]]
+}
+
+detect_clipboard_cmd() {
+  if command -v pbcopy >/dev/null 2>&1; then
+    clipboard_cmd=(pbcopy)
+    return 0
+  fi
+  if command -v wl-copy >/dev/null 2>&1; then
+    clipboard_cmd=(wl-copy)
+    return 0
+  fi
+  if command -v xclip >/dev/null 2>&1; then
+    clipboard_cmd=(xclip -selection clipboard)
+    return 0
+  fi
+  if command -v xsel >/dev/null 2>&1; then
+    clipboard_cmd=(xsel --clipboard --input)
+    return 0
+  fi
+  return 1
+}
+
+print_command() {
+  local label="Command:"
+  if color_enabled; then
+    label=$'\033[90mCommand:\033[0m'
+  fi
+  if is_tty_output; then
+    printf '%s %s\n' "$label" "$cmd"
+  else
+    printf '%s\n' "$cmd"
+  fi
+}
+
+prompt_copy_to_clipboard() {
+  if ! is_tty_input || ! is_tty_output; then
+    return 0
+  fi
+  if ! detect_clipboard_cmd; then
+    return 0
+  fi
+  printf 'Copy to clipboard? [Y/n] ' >&2
+  local reply=""
+  if ! IFS= read -r reply; then
+    return 0
+  fi
+  reply="$(printf '%s' "$reply" | tr '[:upper:]' '[:lower:]')"
+  if [[ -z "$reply" || "$reply" == "y" || "$reply" == "yes" ]]; then
+    printf '%s' "$cmd" | "${clipboard_cmd[@]}" >/dev/null 2>&1 || true
+  fi
+}
+
+read_last_context() {
+  last_question=""
+  last_cmd=""
+  last_why=""
+  if [[ ! -f "$state_file" ]]; then
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  local output
+  local status
+  set +e
+  output=$(
+    python3 - "$state_file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+def clean(value):
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = str(value)
+    return value.replace("\n", " ").strip()
+
+print(clean(data.get("question", "")))
+print(clean(data.get("cmd", "")))
+print(clean(data.get("why", "")))
+PY
+  )
+  status=$?
+  set -e
+  if [[ $status -ne 0 ]]; then
+    return 0
+  fi
+  mapfile -t lines <<<"$output"
+  last_question="${lines[0]:-}"
+  last_cmd="${lines[1]:-}"
+  last_why="${lines[2]:-}"
+}
+
+write_last_context() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+  local tmp_file=""
+  local status
+  set +e
+  mkdir -p "$state_dir"
+  status=$?
+  if [[ $status -ne 0 ]]; then
+    set -e
+    return 0
+  fi
+  tmp_file="$(mktemp "${state_dir}/.last.json.XXXXXX")"
+  status=$?
+  if [[ $status -ne 0 || -z "$tmp_file" ]]; then
+    set -e
+    return 0
+  fi
+  python3 - "$tmp_file" "$user_request" "$cmd" "$why" "$model" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+
+path, question, cmd, why, model = sys.argv[1:6]
+data = {
+    "question": question,
+    "cmd": cmd,
+    "timestamp": datetime.now(timezone.utc).isoformat(),
+}
+if why:
+    data["why"] = why
+if model:
+    data["model"] = model
+
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f)
+PY
+  status=$?
+  if [[ $status -eq 0 ]]; then
+    mv "$tmp_file" "$state_file" >/dev/null 2>&1 || true
+  else
+    rm -f "$tmp_file"
+  fi
+  set -e
+}
 
 explain=0
 raw=0
@@ -92,6 +255,17 @@ fi
 user_request="${args[*]}"
 
 clarifications=""
+read_last_context
+last_context=""
+if [[ -n "$last_cmd" ]]; then
+  last_context=$(cat <<EOF
+Previous command context (may be unrelated; ignore unless the user indicates a failure or correction):
+- Previous request: ${last_question}
+- Previous command: ${last_cmd}
+${last_why:+- Previous explanation: ${last_why}}
+EOF
+)
+fi
 
 while :; do
   prompt=$(cat <<PROMPT
@@ -108,6 +282,8 @@ Only output one CMD line. Prefer bash-compatible, safe, concise commands.
 User request: ${user_request}
 ${clarifications:+Clarifications:
 $clarifications}
+${last_context:+
+$last_context}
 PROMPT
   )
 
@@ -161,10 +337,12 @@ PROMPT
   done <<<"$llm_output"
 
   if [[ -n "$cmd" ]]; then
-    printf '%s\n' "$cmd"
+    write_last_context
+    print_command
     if [[ $explain -eq 1 && -n "$why" ]]; then
       printf '%s\n' "$why"
     fi
+    prompt_copy_to_clipboard
     exit 0
   fi
 

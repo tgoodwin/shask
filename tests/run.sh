@@ -106,7 +106,15 @@ PY
 )
   LAST_STATUS=$?
   set -e
-  LAST_OUT=$(printf '%s\n' "$LAST_OUT" | tr -d '\r' | awk 'NF{last=$0} END{print last}')
+  local tty_out
+  tty_out=$(printf '%s\n' "$LAST_OUT" | tr -d '\r' | sed $'s/\x1B\\[[0-9;]*[A-Za-z]//g')
+  local cmd_line
+  cmd_line=$(printf '%s\n' "$tty_out" | awk 'match($0, /Command: /){last=substr($0, RSTART)} END{print last}')
+  if [[ -n "$cmd_line" ]]; then
+    LAST_OUT="${cmd_line#Command: }"
+  else
+    LAST_OUT=$(printf '%s\n' "$tty_out" | awk 'NF{last=$0} END{print last}')
+  fi
   LAST_ERR=$(cat "$stderr_file")
   rm -f "$stderr_file"
 }
@@ -119,6 +127,18 @@ assert_eq() {
     echo "FAIL: $context" >&2
     echo "  expected: [$expected]" >&2
     echo "  actual:   [$actual]" >&2
+    exit 1
+  fi
+}
+
+assert_contains() {
+  local needle="$1"
+  local haystack="$2"
+  local context="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    echo "FAIL: $context" >&2
+    echo "  expected to contain: [$needle]" >&2
+    echo "  actual: [$haystack]" >&2
     exit 1
   fi
 }
@@ -146,9 +166,40 @@ NEED_MORE_INFO: which directory?
 CMD: ls -la /tmp
 WHY: list tmp
 RESP
-run_asksh_tty "$resp_file" $'/tmp\n' \"list files\"
+run_asksh_tty "$resp_file" $'/tmp\n\n' \"list files\"
 assert_eq "ls -la /tmp" "$LAST_OUT" "tty returns command after clarification"
 rm -f "$resp_file"
+
+# Test: writes last command state file
+STATE_DIR="$TMP_DIR/state"
+export XDG_STATE_HOME="$STATE_DIR"
+run_asksh $'CMD: ls -la\nWHY: list files' list files
+state_file="$STATE_DIR/shask/last.json"
+if [[ ! -f "$state_file" ]]; then
+  echo "FAIL: state file not written" >&2
+  exit 1
+fi
+state_contents="$(cat "$state_file")"
+assert_contains '"cmd": "ls -la"' "$state_contents" "state writes cmd"
+assert_contains '"question": "list files"' "$state_contents" "state writes question"
+unset XDG_STATE_HOME
+
+# Test: injects last command context into prompt
+STATE_DIR="$TMP_DIR/state2"
+export XDG_STATE_HOME="$STATE_DIR"
+mkdir -p "$STATE_DIR/shask"
+cat <<'JSON' > "$STATE_DIR/shask/last.json"
+{"question":"prev question","cmd":"prev cmd","why":"prev why"}
+JSON
+capture_file="$TMP_DIR/llm_args.txt"
+export LLM_CAPTURE_ARGS="$capture_file"
+run_asksh $'CMD: echo hi\nWHY: greet' \"new request\"
+prompt_contents="$(cat "$capture_file")"
+assert_contains "Previous command context" "$prompt_contents" "prompt includes previous context"
+assert_contains "Previous command: prev cmd" "$prompt_contents" "prompt includes previous command"
+assert_contains "ignore unless the user indicates a failure or correction" "$prompt_contents" "prompt includes ignore instruction"
+unset LLM_CAPTURE_ARGS
+unset XDG_STATE_HOME
 
 # Test: --raw prints output verbatim
 run_asksh $'hello\nworld' --raw \"list files\"
